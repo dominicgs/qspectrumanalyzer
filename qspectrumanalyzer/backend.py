@@ -303,12 +303,13 @@ class HackRFSweepThread(RtlPowerBaseThread):
         self.fft_size = 64
         self.freqs = [self.get_hop_freq(hop) for hop in range(hops)]
         self.freqs_crop = [(f[0] + crop_freq, f[1] - crop_freq) for f in self.freqs]
-        self.databuffer = {"timestamp": [], "x": [], "y": []}
+        self.databuffer = {} # {"timestamp": [], "x": [], "y": []}
         self.databuffer_hop = {"timestamp": [], "x": [], "y": []}
         self.hop = 0
         self.prev_line = ""
         self.prev_freq = 0
         self.skip = True
+        self.last_timestamp = ""
 
         print("hackrf_sweep params:")
         pprint.pprint(self.params)
@@ -338,29 +339,41 @@ class HackRFSweepThread(RtlPowerBaseThread):
             return -80
         return num
 
-    def parse_output(self, buf):
-        """Parse one buf of output from hackrf_sweep"""
-        data = np.fromstring(buf, dtype='<f4')
-        centre_freq = data[0] * 1e6
+    def parse_output(self, line):
+        line = str(line,'utf-8')
+        """Parse one line of output from hackrf_sweep"""
+        line = [col.strip() for col in line.split(",")]
+        timestamp = " ".join(line[:2])
+        start_freq = int(line[2])
+        stop_freq = int(line[3])
+        step = float(line[4])
+        samples = float(line[5])
 
-        if centre_freq != self.prev_freq:
-            if centre_freq < self.prev_freq:
-                # Skip first run through in case it was incomplete
-                # otherwise the data_storage array sizes are setup incorrectly and mismatch later
-                if not self.skip:
-                    sorted_data = sorted(zip(self.databuffer["x"], self.databuffer["y"]))
-                    self.databuffer["x"], self.databuffer["y"] = [list(x) for x in zip(*sorted_data)]
-                    self.data_storage.update(self.databuffer)
-                self.skip = False
-                self.databuffer = {"timestamp": [], "x": [], "y": []}
+        x_axis = list(np.arange(start_freq, stop_freq, step))
+        y_axis = [float(y) for y in line[6:]]
+        if len(x_axis) != len(y_axis):
+            print("ERROR: len(x_axis) != len(y_axis)")
+            print(start_freq, stop_freq, step)
+            print(x_axis)
+            print(len(x_axis), len(y_axis))
+            if len(x_axis) > len(y_axis):
+                print("Trimming x_axis...")
+                x_axis = x_axis[:len(y_axis)]
+            else:
+                print("Trimming y_axis...")
+                y_axis = y_axis[:len(x_axis)]
 
-            fft_size_eighth = int(self.fft_size / 8)
-            valid_bins = list(range(fft_size_eighth, fft_size_eighth * 3)) + list(range(fft_size_eighth * 5, fft_size_eighth * 7))
+        if True: #timestamp != self.last_timestamp:
+            self.last_timestamp = timestamp
+            self.databuffer = {"timestamp": timestamp,
+                               "x": x_axis,
+                               "y": y_axis}
+        else:
+            self.databuffer["x"].extend(x_axis)
+            self.databuffer["y"].extend(y_axis)
 
-            for i in valid_bins:
-                self.databuffer["x"].append(centre_freq + (i - self.fft_size/2) * 20e6 / self.fft_size)
-                self.databuffer["y"].append(self.filter_nan(data[1+i]))
-            self.prev_freq = centre_freq
+        if stop_freq > (self.params["stop_freq"] * 1e6):
+            self.data_storage.update(self.databuffer)
 
 
     def run(self):
@@ -369,10 +382,10 @@ class HackRFSweepThread(RtlPowerBaseThread):
         self.alive = True
         self.rtlPowerStarted.emit()
 
-        while self.alive:
-            buf = self.process.stdout.read(4*(1+self.fft_size))
-            if buf:
-                self.parse_output(buf)
+        for line in self.process.stdout:
+            if not self.alive:
+                break
+            self.parse_output(line)
 
         self.process_stop()
         self.alive = False
